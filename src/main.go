@@ -126,8 +126,6 @@ func handleConnection(clientConn net.Conn) {
 		fmt.Println("Error during data relay:", err)
 		return
 	}
-	// go func() { io.Copy(remoteConn, clientConn) }()
-	// io.Copy(clientConn, remoteConn)
 }
 
 func greetClient(clientConn net.Conn) error {
@@ -159,9 +157,6 @@ func greetClient(clientConn net.Conn) error {
 
 func authenticateRemoteSocks(conn net.Conn, username, password string) error {
 	// Send the authentication methods supported by the client https://datatracker.ietf.org/doc/html/rfc1928#section-3
-	// 0x05: SOCKS5
-	// 0x01: number of authentication methods supported
-	// 0x02: username/password authentication
 	_, err := conn.Write([]byte{SOCKS_VERSION, 0x01, USERNAME_PASSWORD_AUTH})
 	if err != nil {
 		return fmt.Errorf("error sending authentication methods: %w", err)
