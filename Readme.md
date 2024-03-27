@@ -1,6 +1,6 @@
 # SocksAuth
 
-This project turns an authenticated SOCKS5 connection to an authenticated one.
+This project turns an unauthenticated SOCKS5 connection to an authenticated one.
 
 It is kept very minimal, so there is just ~400 LoC in one single file. No tests, no assets, no github workflows, no dependabot, no issue templates, etc. Just the code and this Readme I guess.
 
