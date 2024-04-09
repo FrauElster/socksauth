@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -47,8 +48,15 @@ func main() {
 	flag.Parse()
 
 	// Validate the input
-	if remoteHost == "" || remoteUser == "" || remotePass == "" {
-		log.Fatal("Remote host, user, and password must be provided")
+	if remoteUser == "" || remotePass == "" {
+		log.Fatal("user and password must be provided")
+	}
+	if remoteHost == "" {
+		var err error
+		remoteHost, err = findSocksServer(context.Background())
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	socks5Server(port)
