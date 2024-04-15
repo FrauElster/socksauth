@@ -171,15 +171,14 @@ func (s *Server) handleConnection(parentCtx context.Context, clientConn net.Conn
 	defer remoteConn.Close()
 
 	// Authenticate with the remote SOCKS5 server
-	if s.RemoteUser != "" && s.RemotePass != "" {
-		err := authenticateRemoteSocks(remoteConn, s.RemoteUser, s.RemotePass)
-		if err != nil {
-			if s.onError != nil {
-				err = fmt.Errorf("error authenticating with remote server: %w", err)
-				go s.onError(connId, clientConn, err)
-			}
-			return
+	// TODO: implement unauthenticated connection
+	err = authenticateRemoteSocks(remoteConn, s.RemoteUser, s.RemotePass)
+	if err != nil {
+		if s.onError != nil {
+			err = fmt.Errorf("error authenticating with remote server: %w", err)
+			go s.onError(connId, clientConn, err)
 		}
+		return
 	}
 
 	// Forward the client's request to the remote SOCKS5 server

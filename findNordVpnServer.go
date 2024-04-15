@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
+	"time"
 )
 
 type nordServer struct {
@@ -109,12 +111,45 @@ type nordIPDetails struct {
 	Version int    `json:"version"`
 }
 
+var servers []nordServer
+
 // FindNordVpnServer finds a socks server from the (undocumented) NordVPN API
-func FindNordVpnServer(ctx context.Context) (string, error) {
+func FindNordVpnServer(ctx context.Context) (host string, err error) {
+	// since this operation is kinda slow, we ant to use a very simple cache
+	if len(servers) == 0 {
+		servers, err = findNordVpnServers(ctx)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	for {
+		if len(servers) == 0 {
+			return "", fmt.Errorf("no socks server found")
+		}
+
+		// choose a random server
+		randIdx := rand.Intn(len(servers))
+		chosenAddr := servers[randIdx].Hostname + ":1080"
+
+		// check if the server is reachable
+		conn, err := net.DialTimeout("tcp", chosenAddr, time.Second)
+		if err == nil {
+			conn.Close()
+			return chosenAddr, nil
+		}
+
+		// remove the server from the list
+		servers = removeAtIndexNoOrder(servers, randIdx)
+		continue
+	}
+}
+
+func findNordVpnServers(ctx context.Context) ([]nordServer, error) {
 	url := "https://api.nordvpn.com/v1/servers?limit=0"
 	servers, err := fetchJson[[]nordServer](ctx, url)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	socks5Servers := make([]nordServer, 0)
@@ -128,18 +163,14 @@ func FindNordVpnServer(ctx context.Context) (string, error) {
 		}
 
 		for _, tech := range server.Technologies {
+			// check if it is a SOCKS5 server
 			if tech.ID == 7 {
 				socks5Servers = append(socks5Servers, server)
 			}
 		}
 	}
 
-	if len(socks5Servers) == 0 {
-		return "", fmt.Errorf("no socks server found")
-	}
-
-	choosen := socks5Servers[rand.Intn(len(socks5Servers))]
-	return choosen.Hostname + ":1080", nil
+	return socks5Servers, nil
 }
 
 func fetchJson[T any](ctx context.Context, url string) (defaultVal T, err error) {
@@ -190,4 +221,16 @@ func fetchJson[T any](ctx context.Context, url string) (defaultVal T, err error)
 	}
 
 	return data, nil
+}
+
+// removeAtIndexNoOrder removes an element at index idx from a slice a without preserving the order of the remaining elements.
+func removeAtIndexNoOrder[T any](a []T, idx int) []T {
+	// Check if the index is within the range of the slice
+	if idx < 0 || idx >= len(a) {
+		return a
+	}
+	// Swap the element with the last one
+	a[idx] = a[len(a)-1]
+	// Return the slice excluding the last element
+	return a[:len(a)-1]
 }
