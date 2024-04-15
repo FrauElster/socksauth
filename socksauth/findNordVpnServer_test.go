@@ -1,4 +1,4 @@
-package main
+package socksauth
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 )
 
 func TestFindNordVpnServers(t *testing.T) {
-	servers, err := findSocksServer(context.Background())
+	servers, err := FindNordVpnServer(context.Background())
 	if err != nil {
 		t.Error(err)
 	}

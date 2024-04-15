@@ -1,4 +1,4 @@
-package main
+package socksauth
 
 import (
 	"compress/gzip"
@@ -10,38 +10,38 @@ import (
 	"net/http"
 )
 
-type Server struct {
-	ID             int             `json:"id"`
-	Name           string          `json:"name"`
-	Station        string          `json:"station"`
-	Ipv6Station    string          `json:"ipv6_station,omitempty"`
-	Hostname       string          `json:"hostname"`
-	Load           int             `json:"load"`
-	Status         string          `json:"status"`
-	Type           string          `json:"type"`
-	Locations      []Location      `json:"locations"`
-	Services       []Service       `json:"services"`
-	Technologies   []Technology    `json:"technologies"`
-	Groups         []Group         `json:"groups"`
-	Specifications []Specification `json:"specifications"`
-	Ips            []IP            `json:"ips"`
+type nordServer struct {
+	ID             int                 `json:"id"`
+	Name           string              `json:"name"`
+	Station        string              `json:"station"`
+	Ipv6Station    string              `json:"ipv6_station,omitempty"`
+	Hostname       string              `json:"hostname"`
+	Load           int                 `json:"load"`
+	Status         string              `json:"status"`
+	Type           string              `json:"type"`
+	Locations      []nordLocation      `json:"locations"`
+	Services       []nordService       `json:"services"`
+	Technologies   []nordTechnology    `json:"technologies"`
+	Groups         []nordGroup         `json:"groups"`
+	Specifications []nordSpecification `json:"specifications"`
+	Ips            []nordIP            `json:"ips"`
 }
 
-type Location struct {
-	ID        int     `json:"id"`
-	Latitude  float64 `json:"latitude"`
-	Longitude float64 `json:"longitude"`
-	Country   Country `json:"country"`
+type nordLocation struct {
+	ID        int         `json:"id"`
+	Latitude  float64     `json:"latitude"`
+	Longitude float64     `json:"longitude"`
+	Country   nordCountry `json:"country"`
 }
 
-type Country struct {
-	ID   int    `json:"id"`
-	Name string `json:"name"`
-	Code string `json:"code"`
-	City City   `json:"city"`
+type nordCountry struct {
+	ID   int      `json:"id"`
+	Name string   `json:"name"`
+	Code string   `json:"code"`
+	City nordCity `json:"city"`
 }
 
-type City struct {
+type nordCity struct {
 	ID        int     `json:"id"`
 	Name      string  `json:"name"`
 	Latitude  float64 `json:"latitude"`
@@ -50,74 +50,74 @@ type City struct {
 	HubScore  int     `json:"hub_score"`
 }
 
-type Service struct {
+type nordService struct {
 	ID         int    `json:"id"`
 	Name       string `json:"name"`
 	Identifier string `json:"identifier"`
 }
 
-type Technology struct {
+type nordTechnology struct {
 	ID         int           `json:"id"`
 	Name       string        `json:"name"`
 	Identifier string        `json:"identifier"`
 	Metadata   []interface{} `json:"metadata"` // Use interface{} if the structure of metadata is not known or varies
-	Pivot      Pivot         `json:"pivot"`
+	Pivot      nordPivot     `json:"pivot"`
 }
 
-type Pivot struct {
+type nordPivot struct {
 	TechnologyID int    `json:"technology_id"`
 	ServerID     int    `json:"server_id"`
 	Status       string `json:"status"`
 }
 
-type Group struct {
+type nordGroup struct {
+	ID         int      `json:"id"`
+	Title      string   `json:"title"`
+	Identifier string   `json:"identifier"`
+	Type       nordType `json:"type"`
+}
+
+type nordType struct {
 	ID         int    `json:"id"`
 	Title      string `json:"title"`
 	Identifier string `json:"identifier"`
-	Type       Type   `json:"type"`
 }
 
-type Type struct {
-	ID         int    `json:"id"`
-	Title      string `json:"title"`
-	Identifier string `json:"identifier"`
+type nordSpecification struct {
+	ID         int         `json:"id"`
+	Title      string      `json:"title"`
+	Identifier string      `json:"identifier"`
+	Values     []nordValue `json:"values"`
 }
 
-type Specification struct {
-	ID         int     `json:"id"`
-	Title      string  `json:"title"`
-	Identifier string  `json:"identifier"`
-	Values     []Value `json:"values"`
-}
-
-type Value struct {
+type nordValue struct {
 	ID    int    `json:"id"`
 	Value string `json:"value"`
 }
 
-type IP struct {
-	ID       int       `json:"id"`
-	ServerID int       `json:"server_id"`
-	IpID     int       `json:"ip_id"`
-	Type     string    `json:"type"`
-	Ip       IPDetails `json:"ip"`
+type nordIP struct {
+	ID       int           `json:"id"`
+	ServerID int           `json:"server_id"`
+	IpID     int           `json:"ip_id"`
+	Type     string        `json:"type"`
+	Ip       nordIPDetails `json:"ip"`
 }
 
-type IPDetails struct {
+type nordIPDetails struct {
 	ID      int    `json:"id"`
 	Ip      string `json:"ip"`
 	Version int    `json:"version"`
 }
 
-// findSocksServer finds a socks server from the (undocumented) NordVPN API
-func findSocksServer(ctx context.Context) (string, error) {
+// FindNordVpnServer finds a socks server from the (undocumented) NordVPN API
+func FindNordVpnServer(ctx context.Context) (string, error) {
 	url := "https://api.nordvpn.com/v1/servers?limit=0"
-	servers, err := fetchJson[[]Server](ctx, url)
+	servers, err := fetchJson[[]nordServer](ctx, url)
 	if err != nil {
 		return "", err
 	}
 
-	socks5Servers := make([]Server, 0)
+	socks5Servers := make([]nordServer, 0)
 	for _, server := range servers {
 		if server.Status != "online" {
 			continue
