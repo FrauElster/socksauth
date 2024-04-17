@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync/atomic"
 )
 
@@ -209,6 +210,12 @@ func (s *Server) getTcpConn(ctx context.Context) (conn net.Conn, err error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+	if !strings.HasPrefix(remoteHost, "socks5://") {
+		remoteHost = "socks5://" + remoteHost
+	}
+	if !strings.Contains(remoteHost, ":") {
+		remoteHost += ":1080"
 	}
 
 	conn, err = net.Dial("tcp", remoteHost)
