@@ -34,10 +34,25 @@ const (
 	_IP_V6       = 0x04
 )
 
+var (
+	ErrEstablishClientConn = newError("ERR_ESTABLISH_CLIENT_CONN", "error establishing the client connection")
+	ErrEstablishProxyConn  = newError("ERR_ESTABLISH_PROXY_CONN", "error establishing the proxy connection")
+	ErrAuthentication      = newError("ERR_AUTHENTICATION", "error authenticating with the proxy server")
+	ErrDataTransfer        = newError("ERR_DATA_TRANSFER", "error transferring data between client and proxy server")
+
+	ErrSocksFailure            = newError("ERR_SOCKS_FAILURE", "general SOCKS failure")
+	ErrConnectionNotAllowed    = newError("ERR_CONN_NOT_ALLOWED", "connection not allowed by ruleset")
+	ErrNetworkUnreachable      = newError("ERR_NETWORK_UNREACHABLE", "network unreachable")
+	ErrHostUnreachable         = newError("ERR_HOST_UNREACHABLE", "destination host is unreachable")
+	ErrConnectionRefused       = newError("ERR_CONN_REFUSED", "destination host refused the connection")
+	ErrTTLExpired              = newError("ERR_TTL_EXPIRED", "TTL expired")
+	ErrCommandNotSupported     = newError("ERR_COMMAND_NOT_SUPPORTED", "command not supported")
+	ErrAddressTypeNotSupported = newError("ERR_ADDRESS_TYPE_NOT_SUPPORTED", "address type not supported")
+)
+
 type Server struct {
 	Addr string
 
-	RemoteHost string
 	RemoteUser string
 	RemotePass string
 
@@ -97,22 +112,24 @@ func WithAddr(addr string) ServerOption {
 func NewServer(remoteHost, remoteUser, remotePass string, opts ...ServerOption) *Server {
 	s := &Server{
 		Addr:       ":1080",
-		RemoteHost: remoteHost,
 		RemoteUser: remoteUser,
 		RemotePass: remotePass,
 
 		ConnCount:     atomic.Int64{},
 		OpenConnCount: atomic.Int32{},
-
-		serverFinder: FindNordVpnServer,
 	}
 
 	for _, opt := range opts {
 		opt(s)
 	}
 
-	// we call the serverFinder here to give the injection the chance to cache (the default FindNordVpnServer does)
-	if s.RemoteHost == "" {
+	if remoteHost == "" && s.serverFinder == nil {
+		s.serverFinder = FindNordVpnServer
+	}
+	if s.serverFinder == nil {
+		s.serverFinder = func(ctx context.Context) (string, error) { return remoteHost, nil }
+	} else {
+		// we call the serverFinder here to give the injection the chance to cache (the default FindNordVpnServer does)
 		s.serverFinder(context.Background())
 	}
 
@@ -124,7 +141,6 @@ func (s *Server) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer l.Close()
 	s.Addr = "socks5://" + l.Addr().String()
 
 	var semaphore chan struct{}
@@ -135,7 +151,7 @@ func (s *Server) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return l.Close()
 		default:
 		}
 
@@ -177,126 +193,138 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) handleConnection(ctx context.Context, connId int64, clientConn net.Conn) {
+	conn := &socksConnection{connId: connId, clientConn: clientConn}
+
 	// Greet the client
-	if err := greetClient(clientConn); err != nil {
+	if err := conn.greetClient(); err != nil {
 		if s.onError != nil {
-			err = fmt.Errorf("error greeting client: %w", err)
 			go s.onError(connId, clientConn, err)
 		}
 		return
 	}
 
 	// Connect to the remote SOCKS5 server
-	remoteConn, remoteHost, err := s.getTcpConn(ctx)
+	err := conn.getProxyConn(ctx, s.serverFinder)
 	if err != nil {
 		if s.onError != nil {
 			go s.onError(connId, clientConn, err)
 		}
 		return
 	}
-	defer remoteConn.Close()
+	defer conn.proxyConn.Close()
 
 	// Authenticate with the remote SOCKS5 server
 	// TODO: implement unauthenticated connection
-	err = authenticateRemoteSocks(remoteConn, s.RemoteUser, s.RemotePass)
+	err = conn.authenticateRemoteSocks(s.RemoteUser, s.RemotePass)
 	if err != nil {
 		if s.onError != nil {
-			err = fmt.Errorf("error authenticating with remote server (%s | %s): %w", remoteHost, remoteConn.RemoteAddr().String(), err)
 			go s.onError(connId, clientConn, err)
 		}
 		return
 	}
 
 	// Forward the client's request to the remote SOCKS5 server
-	err = sendRemoteRequest(clientConn, remoteConn)
+	err = conn.sendRemoteRequest()
 	if err != nil {
 		if s.onError != nil {
-			err = fmt.Errorf("error sending request to remote server: %w", err)
 			go s.onError(connId, clientConn, err)
 		}
 		return
 	}
 
 	// Relay data between the client and the remote SOCKS5 server
-	err = syncConns(clientConn, remoteConn)
+	err = conn.syncConns()
 	if err != nil {
 		if s.onError != nil {
-			err = fmt.Errorf("error syncing connections: %w", err)
 			go s.onError(connId, clientConn, err)
 		}
 		return
 	}
 }
 
-func (s *Server) getTcpConn(ctx context.Context) (conn net.Conn, remoteHost string, err error) {
-	remoteHost = s.RemoteHost
-	if remoteHost == "" {
-		remoteHost, err = s.serverFinder(ctx)
-		if err != nil {
-			return nil, remoteHost, err
-		}
-	}
-	remoteHost = strings.TrimPrefix(remoteHost, "socks5://")
-	if !strings.Contains(remoteHost, ":") {
-		remoteHost += ":1080"
-	}
+type socksConnection struct {
+	connId int64
 
-	conn, err = net.Dial("tcp", remoteHost)
-	if err != nil {
-		err = fmt.Errorf("error connecting to remote server (%s): %w", remoteHost, err)
-		return nil, remoteHost, err
-	}
-
-	return conn, remoteHost, nil
+	clientConn, proxyConn net.Conn
+	destination           string
+	proxyName, proxyHost  string
 }
 
-func greetClient(clientConn net.Conn) error {
+func (c *socksConnection) greetClient() SocksError {
 	// https://datatracker.ietf.org/doc/html/rfc1928#section-3
 	header := make([]byte, 2)
-	if _, err := io.ReadFull(clientConn, header); err != nil {
-		return fmt.Errorf("error reading header: %w", err)
+	if _, err := io.ReadFull(c.clientConn, header); err != nil {
+		err = fmt.Errorf("error reading header: %w", err)
+		return ErrEstablishClientConn.fromConnection(*c).withError(err)
 	}
 
 	socksVersion := header[0]
 	if socksVersion != _SOCKS_VERSION {
-		return fmt.Errorf("unsupported SOCKS version: %d", socksVersion)
+		err := fmt.Errorf("unsupported SOCKS version: %d", socksVersion)
+		return ErrEstablishClientConn.fromConnection(*c).withError(err)
 	}
 
 	numMethods := int(header[1])
 	methods := make([]byte, numMethods)
-	if _, err := io.ReadFull(clientConn, methods); err != nil {
-		return fmt.Errorf("error reading methods: %w", err)
+	if _, err := io.ReadFull(c.clientConn, methods); err != nil {
+		err := fmt.Errorf("error reading methods: %w", err)
+		return ErrEstablishClientConn.fromConnection(*c).withError(err)
 	}
 
 	if !contains(methods, _NO_AUTHENTICATION) {
-		clientConn.Write([]byte{_SOCKS_VERSION, _NO_ACCEPTABLE_METHODS})
-		return fmt.Errorf("no supported authentication methods")
+		c.clientConn.Write([]byte{_SOCKS_VERSION, _NO_ACCEPTABLE_METHODS})
+		err := fmt.Errorf("no supported authentication methods")
+		return ErrEstablishClientConn.fromConnection(*c).withError(err)
 	}
 
-	clientConn.Write([]byte{_SOCKS_VERSION, _NO_AUTHENTICATION})
+	c.clientConn.Write([]byte{_SOCKS_VERSION, _NO_AUTHENTICATION})
 	return nil
 }
 
-func authenticateRemoteSocks(conn net.Conn, username, password string) error {
+func (c *socksConnection) getProxyConn(ctx context.Context, hostFinder func(context.Context) (string, error)) SocksError {
+	var err error
+	c.proxyName, err = hostFinder(ctx)
+	if err != nil {
+		err = fmt.Errorf("error finding proxy server: %w", err)
+		return ErrEstablishProxyConn.fromConnection(*c).withError(err)
+	}
+	c.proxyName = strings.TrimPrefix(c.proxyName, "socks5://")
+	if !strings.Contains(c.proxyName, ":") {
+		c.proxyName += ":1080"
+	}
+
+	c.proxyConn, err = net.Dial("tcp", c.proxyName)
+	if err != nil {
+		return ErrEstablishProxyConn.fromConnection(*c).withError(err)
+	}
+	c.proxyHost = c.proxyConn.RemoteAddr().String()
+
+	return nil
+}
+
+func (c *socksConnection) authenticateRemoteSocks(username, password string) SocksError {
 	// Send the authentication methods supported by the client https://datatracker.ietf.org/doc/html/rfc1928#section-3
-	_, err := conn.Write([]byte{
+	_, err := c.proxyConn.Write([]byte{
 		_SOCKS_VERSION,
 		0x01, // number of auth methods
 		_USERNAME_PASSWORD_AUTH,
 	})
 	if err != nil {
-		return fmt.Errorf("error sending authentication methods: %w", err)
+		err = fmt.Errorf("error sending authentication methods: %w", err)
+		return ErrAuthentication.fromConnection(*c).withError(err)
 	}
 
 	// Read the server's choice of authentication method
 	response := make([]byte, 2)
-	if _, err := io.ReadFull(conn, response); err != nil {
-		return fmt.Errorf("error reading authentication method selection: %w", err)
+	if _, err := io.ReadFull(c.proxyConn, response); err != nil {
+		err = fmt.Errorf("error reading authentication method selection: %w", err)
+		return ErrAuthentication.fromConnection(*c).withError(err)
 	}
 
 	// Check if the server selected username/password authentication
 	if response[1] != _USERNAME_PASSWORD_AUTH {
-		return fmt.Errorf("server did not select username/password authentication, selected method: %d", response[1])
+		err = fmt.Errorf("server did not select username/password authentication, selected method: %d", response[1])
+		return ErrAuthentication.fromConnection(*c).withError(err)
 	}
 
 	// Then, send the username and password
@@ -308,32 +336,35 @@ func authenticateRemoteSocks(conn net.Conn, username, password string) error {
 	authRequest[2+len(username)] = byte(len(password))
 	copy(authRequest[3+len(username):], password)
 
-	_, err = conn.Write(authRequest)
+	_, err = c.proxyConn.Write(authRequest)
 	if err != nil {
-		return fmt.Errorf("error sending username/password: %w", err)
+		err = fmt.Errorf("error sending username/password: %w", err)
+		return ErrAuthentication.fromConnection(*c).withError(err)
 	}
 
 	// Read the server's response
 	response = make([]byte, 2)
 	response[1] = 0xff // Set the response to an invalid value to check if the server changes it (00 is success)
-	if _, err := io.ReadFull(conn, response); err != nil {
-		return fmt.Errorf("error reading authentication response: %w", err)
+	if _, err := io.ReadFull(c.proxyConn, response); err != nil {
+		err = fmt.Errorf("error reading authentication response: %w", err)
+		return ErrAuthentication.fromConnection(*c).withError(err)
 	}
 
 	// Check the server's response
 	if response[1] != _STATUS_OK {
-		return fmt.Errorf("authentication failed")
+		err = fmt.Errorf("authentication failed")
+		return ErrAuthentication.fromConnection(*c).withError(err)
 	}
 
 	return nil
 }
 
-func syncConns(clientConn, remoteConn net.Conn) error {
+func (c *socksConnection) syncConns() SocksError {
 	done := make(chan error, 1)
 
 	// Relay data from client to remote
 	go func() {
-		_, err := io.Copy(remoteConn, clientConn)
+		_, err := io.Copy(c.proxyConn, c.clientConn)
 		if errors.Is(err, syscall.ECONNRESET) {
 			done <- nil // this happens when the client disconnects abruptly, rude but not an error
 		}
@@ -347,7 +378,7 @@ func syncConns(clientConn, remoteConn net.Conn) error {
 
 	// Relay data from remote to client
 	go func() {
-		_, err := io.Copy(clientConn, remoteConn)
+		_, err := io.Copy(c.clientConn, c.proxyConn)
 		if errors.Is(err, syscall.ECONNRESET) {
 			done <- nil // this happens when the client disconnects abruptly, rude but not an error
 		}
@@ -361,53 +392,59 @@ func syncConns(clientConn, remoteConn net.Conn) error {
 
 	// Wait for either goroutine to finish
 	err := <-done
-	clientConn.Close()
-	remoteConn.Close()
-
-	return err
+	if err != nil {
+		return ErrDataTransfer.fromConnection(*c).withError(err)
+	}
+	return nil
 }
 
-func sendRemoteRequest(clientConn, remoteConn net.Conn) error {
-	request, err := readSocks5Request(clientConn)
+func (c *socksConnection) sendRemoteRequest() SocksError {
+	request, destination, err := readSocks5Request(c.clientConn)
 	if err != nil {
-		return fmt.Errorf("error reading request from client: %w", err)
+		err = fmt.Errorf("error reading request from client: %w", err)
+		return ErrEstablishClientConn.fromConnection(*c).withError(err)
+	}
+	c.destination = destination
+
+	_, err = c.proxyConn.Write(request)
+	if err != nil {
+		err = fmt.Errorf("error forwarding request to proxy server: %w", err)
+		return ErrEstablishProxyConn.fromConnection(*c).withError(err)
 	}
 
-	_, err = remoteConn.Write(request)
+	response, err := readSocks5Response(c.proxyConn)
 	if err != nil {
-		return fmt.Errorf("error forwarding request to remote server: %w", err)
+		err = fmt.Errorf("error reading response from proxy server: %w", err)
+		return ErrEstablishProxyConn.fromConnection(*c).withError(err)
 	}
 
-	response, err := readSocks5Response(remoteConn)
+	_, err = c.clientConn.Write(response)
 	if err != nil {
-		return fmt.Errorf("error reading response from remote server: %w", err)
-	}
-
-	_, err = clientConn.Write(response)
-	if err != nil {
-		return fmt.Errorf("error forwarding response to client: %w", err)
+		err = fmt.Errorf("error forwarding response to client: %w", err)
+		return ErrEstablishClientConn.fromConnection(*c).withError(err)
 	}
 
 	return nil
 }
 
-func readSocks5Request(conn net.Conn) ([]byte, error) {
+func readSocks5Request(conn net.Conn) (request []byte, destination string, err error) {
 	// Read the SOCKS request from the client https://datatracker.ietf.org/doc/html/rfc1928#section-4
 	// Read the first 4 Bytes of the request, the fourth byte determines the length of the rest of the request
 	requestHeader := make([]byte, 4)
 	if _, err := io.ReadFull(conn, requestHeader); err != nil {
-		return nil, fmt.Errorf("error reading request header: %w", err)
+		return nil, "", fmt.Errorf("error reading request header: %w", err)
 	}
 
 	version := requestHeader[0]
 	if version != _SOCKS_VERSION {
-		return nil, fmt.Errorf("unsupported SOCKS version: %d", version)
+		conn.Write([]byte{_SOCKS_VERSION, _GENERAL_SOCKS_FAILURE})
+		return nil, "", fmt.Errorf("unsupported SOCKS version: %d", version)
 	}
 
 	cmd := requestHeader[1]
 	if cmd != _CONNECT {
 		conn.Write([]byte{_SOCKS_VERSION, _COMMAND_NOT_SUPPORTED})
-		return nil, fmt.Errorf("unsupported command: %d", cmd)
+		return nil, "", ErrCommandNotSupported.withMessage(fmt.Sprintf("unsupported command: %d", cmd))
 	}
 
 	// Determine the length of the remaining part of the request based on the address type
@@ -418,7 +455,7 @@ func readSocks5Request(conn net.Conn) ([]byte, error) {
 	case _DOMAIN_NAME:
 		lengthByte := make([]byte, 1)
 		if _, err := io.ReadFull(conn, lengthByte); err != nil {
-			return nil, fmt.Errorf("error reading domain name length: %w", err)
+			return nil, "", fmt.Errorf("error reading domain name length: %w", err)
 		}
 		requestHeader = append(requestHeader, lengthByte...)
 		addrLen = int(lengthByte[0])
@@ -426,19 +463,35 @@ func readSocks5Request(conn net.Conn) ([]byte, error) {
 		addrLen = net.IPv6len
 	default:
 		conn.Write([]byte{_SOCKS_VERSION, _ADDRESS_TYPE_NOT_SUPPORTED})
-		return nil, fmt.Errorf("unknown address type: %d", requestHeader[3])
+		return nil, "", ErrAddressTypeNotSupported.withMessage(fmt.Sprintf("unknown address type: %d", requestHeader[3]))
 	}
 
 	// Read the rest of the request
 	requestRest := make([]byte, addrLen+2) // +2 for port number
 	if _, err := io.ReadFull(conn, requestRest); err != nil {
 		conn.Write([]byte{_SOCKS_VERSION, _GENERAL_SOCKS_FAILURE})
-		return nil, fmt.Errorf("error reading the rest of the request: %w", err)
+		return nil, "", fmt.Errorf("error reading the rest of the request: %w", err)
 	}
 
 	// Combine the header and the rest of the request
 	fullRequest := append(requestHeader, requestRest...)
-	return fullRequest, nil
+
+	// we are done here, but for logging purpose we will extract the destination
+	var destinationAddr string
+	var destinationPort int
+	switch fullRequest[3] {
+	case _IP_V4:
+		destinationAddr = net.IP(fullRequest[4 : 4+net.IPv4len]).String()
+		destinationPort = int(fullRequest[len(fullRequest)-2])<<8 | int(fullRequest[len(fullRequest)-1])
+	case _DOMAIN_NAME:
+		destinationAddr = string(fullRequest[5 : 5+fullRequest[4]])
+		destinationPort = int(fullRequest[len(fullRequest)-2])<<8 | int(fullRequest[len(fullRequest)-1])
+	case _IP_V6:
+		destinationAddr = net.IP(fullRequest[4 : 4+net.IPv6len]).String()
+		destinationPort = int(fullRequest[len(fullRequest)-2])<<8 | int(fullRequest[len(fullRequest)-1])
+	}
+
+	return fullRequest, fmt.Sprintf("%s:%d", destinationAddr, destinationPort), nil
 }
 
 func readSocks5Response(conn net.Conn) ([]byte, error) {

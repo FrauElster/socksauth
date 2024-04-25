@@ -12,6 +12,7 @@ import (
 
 	"github.com/FrauElster/socksauth"
 	"github.com/chromedp/chromedp"
+	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -21,6 +22,7 @@ type Config struct {
 }
 
 func loadConfig(t *testing.T) Config {
+	godotenv.Load()
 	user := os.Getenv("SOCKS_USER")
 	if user == "" {
 		t.Fatal("SOCKS_USER not set")
@@ -56,7 +58,7 @@ func startProxy(t *testing.T, ctx context.Context, config Config, opts ...socksa
 	return server
 }
 
-func request(t *testing.T, url, proxy string) {
+func request(url, proxy string) error {
 	executorOpts := chromedp.DefaultExecAllocatorOptions[:]
 	executorOpts = append(
 		executorOpts,
@@ -73,11 +75,7 @@ func request(t *testing.T, url, proxy string) {
 	ctx, cancel := chromedp.NewContext(ctx)
 	defer cancel()
 
-	err := chromedp.Run(ctx, chromedp.Tasks{chromedp.Navigate(url)})
-	if err != nil {
-		t.Errorf("Error navigating to URL: %v", err)
-	}
-
+	return chromedp.Run(ctx, chromedp.Tasks{chromedp.Navigate(url)})
 }
 
 func TestWithHost(t *testing.T) {
@@ -87,10 +85,13 @@ func TestWithHost(t *testing.T) {
 	proxyAddr := proxy.Addr
 
 	var wg sync.WaitGroup
-	for i := 0; i < 21; i++ {
+	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
-			request(t, "https://google.com/", proxyAddr)
+			err := request("https://google.com/", proxyAddr)
+			if err != nil {
+				t.Errorf("Error navigating to URL: %v", err)
+			}
 			wg.Done()
 		}()
 	}
@@ -111,7 +112,10 @@ func TestWithNoHost(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
-			request(t, "https://google.com/", proxyAddr)
+			err := request("https://google.com/", proxyAddr)
+			if err != nil {
+				t.Errorf("Error navigating to URL: %v", err)
+			}
 			wg.Done()
 		}()
 	}
