@@ -28,7 +28,9 @@ func main() {
 	}
 
 	// build the server
-	onError := func(connId int64, conn net.Conn, err error) { slog.Error("Error", "connId", connId, "err", err) }
+	onError := func(connId int64, conn net.Conn, err socksauth.SocksError) {
+		slog.Error("Error", "connId", connId, "err", err)
+	}
 	onConnect := func(connId int64, conn net.Conn) {
 		slog.Debug("Connected", "connId", connId, "addr", conn.RemoteAddr())
 	}

@@ -62,7 +62,7 @@ type Server struct {
 
 	onConnect    func(id int64, conn net.Conn)
 	onDisconnect func(id int64, conn net.Conn)
-	onError      func(id int64, conn net.Conn, err error)
+	onError      func(id int64, conn net.Conn, err SocksError)
 
 	serverFinder func(context.Context) (string, error)
 }
@@ -90,7 +90,7 @@ func WithOnDisconnect(fn func(id int64, conn net.Conn)) ServerOption {
 // WithOnError sets the onError callback which is called when an error occurs on a connection.
 // If the error occurs while accepting a connection the id is 0 and the conn argument will be nil
 // To not block the server the callback is called in a new goroutine
-func WithOnError(fn func(id int64, conn net.Conn, err error)) ServerOption {
+func WithOnError(fn func(id int64, conn net.Conn, err SocksError)) ServerOption {
 	return func(s *Server) { s.onError = fn }
 }
 
@@ -159,7 +159,7 @@ func (s *Server) Start(ctx context.Context) error {
 		if err != nil {
 			if s.onError != nil {
 				err = fmt.Errorf("error accepting connection: %w", err)
-				go s.onError(0, conn, err)
+				go s.onError(0, conn, ErrEstablishClientConn.withError(err))
 			}
 			continue
 		}
@@ -169,21 +169,7 @@ func (s *Server) Start(ctx context.Context) error {
 			semaphore <- struct{}{}
 		}
 		go func() {
-			connId := s.ConnCount.Add(1)
-			s.OpenConnCount.Add(1)
-			if s.onConnect != nil {
-				go s.onConnect(connId, conn)
-			}
-			connCtx, cancel := context.WithCancel(ctx)
-
-			s.handleConnection(connCtx, connId, conn)
-
-			if s.onDisconnect != nil {
-				go s.onDisconnect(connId, conn)
-			}
-			conn.Close()
-			cancel()
-			s.OpenConnCount.Add(-1)
+			s.handleConnection(ctx, conn)
 			// release semaphore
 			if semaphore != nil {
 				semaphore <- struct{}{}
@@ -192,13 +178,28 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 }
 
-func (s *Server) handleConnection(ctx context.Context, connId int64, clientConn net.Conn) {
-	conn := &socksConnection{connId: connId, clientConn: clientConn}
+func (s *Server) handleConnection(ctx context.Context, clientConn net.Conn) {
+	conn := &socksConnection{connId: s.ConnCount.Add(1), clientConn: clientConn}
+
+	s.OpenConnCount.Add(1)
+	if s.onConnect != nil {
+		go s.onConnect(conn.connId, conn.clientConn)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+
+	defer func() {
+		if s.onDisconnect != nil {
+			go s.onDisconnect(conn.connId, conn.clientConn)
+		}
+		conn.clientConn.Close()
+		cancel()
+		s.OpenConnCount.Add(-1)
+	}()
 
 	// Greet the client
 	if err := conn.greetClient(); err != nil {
 		if s.onError != nil {
-			go s.onError(connId, clientConn, err)
+			go s.onError(conn.connId, clientConn, err)
 		}
 		return
 	}
@@ -207,7 +208,7 @@ func (s *Server) handleConnection(ctx context.Context, connId int64, clientConn 
 	err := conn.getProxyConn(ctx, s.serverFinder)
 	if err != nil {
 		if s.onError != nil {
-			go s.onError(connId, clientConn, err)
+			go s.onError(conn.connId, clientConn, err)
 		}
 		return
 	}
@@ -218,7 +219,7 @@ func (s *Server) handleConnection(ctx context.Context, connId int64, clientConn 
 	err = conn.authenticateRemoteSocks(s.RemoteUser, s.RemotePass)
 	if err != nil {
 		if s.onError != nil {
-			go s.onError(connId, clientConn, err)
+			go s.onError(conn.connId, clientConn, err)
 		}
 		return
 	}
@@ -227,7 +228,7 @@ func (s *Server) handleConnection(ctx context.Context, connId int64, clientConn 
 	err = conn.sendRemoteRequest()
 	if err != nil {
 		if s.onError != nil {
-			go s.onError(connId, clientConn, err)
+			go s.onError(conn.connId, clientConn, err)
 		}
 		return
 	}
@@ -236,7 +237,7 @@ func (s *Server) handleConnection(ctx context.Context, connId int64, clientConn 
 	err = conn.syncConns()
 	if err != nil {
 		if s.onError != nil {
-			go s.onError(connId, clientConn, err)
+			go s.onError(conn.connId, clientConn, err)
 		}
 		return
 	}
@@ -366,6 +367,7 @@ func (c *socksConnection) syncConns() SocksError {
 	go func() {
 		_, err := io.Copy(c.proxyConn, c.clientConn)
 		if errors.Is(err, syscall.ECONNRESET) {
+			fmt.Printf("[connection %d] proxy -> client: disconnected\n", c.connId)
 			done <- nil // this happens when the client disconnects abruptly, rude but not an error
 		}
 		if err != nil {
@@ -380,6 +382,7 @@ func (c *socksConnection) syncConns() SocksError {
 	go func() {
 		_, err := io.Copy(c.clientConn, c.proxyConn)
 		if errors.Is(err, syscall.ECONNRESET) {
+			fmt.Printf("[connection %d] client -> proxy: disconnected\n", c.connId)
 			done <- nil // this happens when the client disconnects abruptly, rude but not an error
 		}
 		if err != nil {
@@ -514,28 +517,28 @@ func readSocks5Response(conn net.Conn) ([]byte, error) {
 	case _STATUS_OK:
 	case _GENERAL_SOCKS_FAILURE:
 		conn.Write([]byte{_SOCKS_VERSION, header[1]})
-		return nil, fmt.Errorf("general SOCKS server failure")
+		return nil, ErrSocksFailure
 	case _CONN_NOT_ALLOWED_BY_RULESET:
 		conn.Write([]byte{_SOCKS_VERSION, header[1]})
-		return nil, fmt.Errorf("connection not allowed by ruleset")
+		return nil, ErrConnectionNotAllowed
 	case _NETWORK_UNREACHABLE:
 		conn.Write([]byte{_SOCKS_VERSION, header[1]})
-		return nil, fmt.Errorf("network unreachable")
+		return nil, ErrNetworkUnreachable
 	case _HOST_UNREACHABLE:
 		conn.Write([]byte{_SOCKS_VERSION, header[1]})
-		return nil, fmt.Errorf("host unreachable")
+		return nil, ErrHostUnreachable
 	case _CONN_REFUSED:
 		conn.Write([]byte{_SOCKS_VERSION, header[1]})
-		return nil, fmt.Errorf("connection refused")
+		return nil, ErrConnectionRefused
 	case _TTL_EXPIRED:
 		conn.Write([]byte{_SOCKS_VERSION, header[1]})
-		return nil, fmt.Errorf("TTL expired")
+		return nil, ErrTTLExpired
 	case _COMMAND_NOT_SUPPORTED:
 		conn.Write([]byte{_SOCKS_VERSION, header[1]})
-		return nil, fmt.Errorf("command not supported")
+		return nil, ErrCommandNotSupported
 	case _ADDRESS_TYPE_NOT_SUPPORTED:
 		conn.Write([]byte{_SOCKS_VERSION, header[1]})
-		return nil, fmt.Errorf("address type not supported")
+		return nil, ErrAddressTypeNotSupported
 	default:
 		conn.Write([]byte{_SOCKS_VERSION, _GENERAL_SOCKS_FAILURE})
 		return nil, fmt.Errorf("unknown reply: %d", reply)

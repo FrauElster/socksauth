@@ -37,7 +37,7 @@ func loadConfig(t *testing.T) Config {
 }
 
 func startProxy(t *testing.T, ctx context.Context, config Config, opts ...socksauth.ServerOption) *socksauth.Server {
-	onError := func(connId int64, conn net.Conn, err error) {
+	onError := func(connId int64, conn net.Conn, err socksauth.SocksError) {
 		t.Errorf("Error on connection %d: %v", connId, err)
 	}
 
@@ -88,7 +88,7 @@ func TestWithHost(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
-			err := request("https://google.com/", proxyAddr)
+			err := request("https://akf-shop.de/", proxyAddr)
 			if err != nil {
 				t.Errorf("Error navigating to URL: %v", err)
 			}
