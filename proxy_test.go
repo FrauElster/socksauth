@@ -27,7 +27,6 @@ func mustStartProxy(t *testing.T) (*Proxy, int) {
 		os.Getenv("SOCKS_PASSWORD"),
 		os.Getenv("SOCKS_HOST"),
 	)
-	proxy.UseOld = true
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}

@@ -1,11 +1,13 @@
 package socksauth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -13,7 +15,11 @@ type Proxy struct {
 	Username string
 	Password string
 	NextHost string
-	UseOld   bool
+
+	listener     net.Listener
+	activeConns  sync.Map
+	shutdownChan chan struct{}
+	wg           sync.WaitGroup
 }
 
 func NewProxy(username, password, nextHost string) (*Proxy, error) {
@@ -34,9 +40,10 @@ func NewProxy(username, password, nextHost string) (*Proxy, error) {
 	nextHost = strings.TrimPrefix(nextHost, "socks5://")
 
 	return &Proxy{
-		Username: username,
-		Password: password,
-		NextHost: nextHost,
+		Username:     username,
+		Password:     password,
+		NextHost:     nextHost,
+		shutdownChan: make(chan struct{}),
 	}, nil
 }
 
@@ -46,12 +53,22 @@ func (p *Proxy) Start(listenPort int) error {
 	if err != nil {
 		return fmt.Errorf("failed to start listener on %s: %w", addr, err)
 	}
-	defer listener.Close()
+	p.listener = listener
+
+	go func() {
+		<-p.shutdownChan
+		p.listener.Close()
+	}()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
+			select {
+			case <-p.shutdownChan:
+				return nil
+			default:
+				return fmt.Errorf("failed to accept connection: %w", err)
+			}
 		}
 
 		tcpConn, ok := conn.(*net.TCPConn)
@@ -70,7 +87,46 @@ func (p *Proxy) Start(listenPort int) error {
 			continue
 		}
 
-		go p.handleConnection(tcpConn)
+		p.wg.Add(1)
+		p.activeConns.Store(tcpConn, struct{}{})
+		go func() {
+			defer p.wg.Done()
+			defer p.activeConns.Delete(tcpConn)
+			p.handleConnection(tcpConn)
+		}()
+	}
+}
+
+// Shutdown gracefully shuts down the proxy server
+func (p *Proxy) Shutdown(ctx context.Context) error {
+	// Signal shutdown
+	close(p.shutdownChan)
+
+	// Close listener
+	if p.listener != nil {
+		p.listener.Close()
+	}
+
+	// Close all active connections
+	p.activeConns.Range(func(key, value interface{}) bool {
+		if conn, ok := key.(net.Conn); ok {
+			conn.Close()
+		}
+		return true
+	})
+
+	// Wait for all connections to finish with context timeout
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
 	}
 }
 
