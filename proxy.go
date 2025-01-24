@@ -298,8 +298,10 @@ func (p *Proxy) forwardTraffic(clientConn, nextProxy net.Conn) (err error) {
 	done := make(chan error, 2)
 	go func() {
 		_, err := io.Copy(nextProxy, clientConn)
-		if err != nil {
+		if err != nil && !isConnectionClosedError(err) {
 			err = fmt.Errorf("failed to copy from client to proxy: %w", err)
+		} else {
+			err = nil // Clear error if it's just a connection closure
 		}
 		nextProxy.(*net.TCPConn).CloseWrite()
 		done <- err
@@ -307,8 +309,10 @@ func (p *Proxy) forwardTraffic(clientConn, nextProxy net.Conn) (err error) {
 
 	go func() {
 		_, err := io.Copy(clientConn, nextProxy)
-		if err != nil {
+		if err != nil && !isConnectionClosedError(err) {
 			err = fmt.Errorf("failed to copy from proxy to client: %w", err)
+		} else {
+			err = nil // Clear error if it's just a connection closure
 		}
 		clientConn.(*net.TCPConn).CloseWrite()
 		done <- err
@@ -427,4 +431,15 @@ func readConnectionResponse(nextProxy net.Conn) ([]byte, error) {
 	}
 
 	return append(response, addr...), nil
+}
+
+func isConnectionClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		strings.Contains(err.Error(), "broken pipe") ||
+		strings.Contains(err.Error(), "connection reset by peer") ||
+		strings.Contains(err.Error(), "use of closed network connection")
 }
