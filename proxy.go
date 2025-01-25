@@ -11,6 +11,95 @@ import (
 	"time"
 )
 
+const (
+	socksSucceeded           = 0
+	socksGeneralFailure      = 1
+	socksNotAllowed          = 2
+	socksNetworkUnreachable  = 3
+	socksHostUnreachable     = 4
+	socksConnectionRefused   = 5
+	socksTTLExpired          = 6
+	socksCommandNotSupported = 7
+	socksAddressNotSupported = 8
+	socksUnknownError        = 9
+	socksNoAcceptableMethods = 0xFF
+
+	socksVersion5   = 5
+	socksCmdConnect = 1
+
+	socksAuthNoneRequired = 0
+	socksAuthUsernamePass = 2
+
+	socksAddrIPv4 = 1
+	socksAddrFQDN = 3
+	socksAddrIPv6 = 4
+)
+
+var (
+	errNoAcceptableAuth       = errors.New("no acceptable authentication methods")
+	errUnsupportedCommand     = errors.New("unsupported command")
+	errUnsupportedAddressType = errors.New("unsupported address type")
+
+	errGeneralFailure       = errors.New("general SOCKS server failure")
+	errConnectionNotAllowed = errors.New("connection not allowed by ruleset")
+	errNetworkUnreachable   = errors.New("network unreachable")
+	errHostUnreachable      = errors.New("host unreachable")
+	errConnectionRefused    = errors.New("connection refused by destination host")
+	errTTLExpired           = errors.New("TTL expired")
+	errCommandNotSupported  = errors.New("command not supported / protocol error")
+	errAddressNotSupported  = errors.New("address type not supported")
+	errAuthFailed           = errors.New("authentication failed")
+)
+
+type tcpConnHandler struct {
+	conn *net.TCPConn
+}
+
+func newTCPConnHandler(conn net.Conn) (*tcpConnHandler, error) {
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		conn.Close()
+		return nil, errors.New("not a TCP connection")
+	}
+
+	// Set keep-alive for the connection
+	if err := tcpConn.SetKeepAlive(true); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("failed to set keep-alive: %w", err)
+	}
+	if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("failed to set keep-alive period: %w", err)
+	}
+
+	return &tcpConnHandler{conn: tcpConn}, nil
+}
+
+// Helper function to send SOCKS5 error responses
+func sendSocks5Error(conn net.Conn, request []byte, errCode byte) error {
+	if len(request) < 4 {
+		// If we don't have the original request, fallback to IPv4 format
+		response := []byte{
+			socksVersion5, // SOCKS version
+			errCode,       // Error code
+			0,             // Reserved
+			1,             // Address type (IPv4)
+			0, 0, 0, 0,    // IPv4 address (0.0.0.0)
+			0, 0, // Port (0)
+		}
+		_, err := conn.Write(response)
+		return err
+	}
+
+	// Create response maintaining the address type and address from request
+	response := make([]byte, 0, len(request))
+	response = append(response, socksVersion5, errCode, 0) // SOCKS version, error code, reserved
+	response = append(response, request[3:]...)            // Address type and address and port
+
+	_, err := conn.Write(response)
+	return err
+}
+
 type Proxy struct {
 	Username string
 	Password string
@@ -71,28 +160,17 @@ func (p *Proxy) Start(listenPort int) error {
 			}
 		}
 
-		tcpConn, ok := conn.(*net.TCPConn)
-		if !ok {
-			conn.Close()
-			continue
-		}
-
-		// Set keep-alive for the connection
-		if err := tcpConn.SetKeepAlive(true); err != nil {
-			tcpConn.Close()
-			continue
-		}
-		if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
-			tcpConn.Close()
+		handler, err := newTCPConnHandler(conn)
+		if err != nil {
 			continue
 		}
 
 		p.wg.Add(1)
-		p.activeConns.Store(tcpConn, struct{}{})
+		p.activeConns.Store(handler.conn, struct{}{})
 		go func() {
 			defer p.wg.Done()
-			defer p.activeConns.Delete(tcpConn)
-			p.handleConnection(tcpConn)
+			defer p.activeConns.Delete(handler.conn)
+			p.handleConnection(handler.conn)
 		}()
 	}
 }
@@ -130,64 +208,109 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (p *Proxy) handleConnection(clientConn net.Conn) {
-	// Convert to TCP connection for access to CloseWrite
-	tcpConn, ok := clientConn.(*net.TCPConn)
-	if !ok {
-		fmt.Printf("Client connection is not TCP\n")
-		clientConn.Close()
+func (p *Proxy) handleConnection(clientConn *net.TCPConn) {
+	defer clientConn.Close()
+
+	// Start connecting to the next proxy early in a separate goroutine
+	type proxyResult struct {
+		conn *net.TCPConn
+		err  error
+	}
+	proxyConnChan := make(chan proxyResult, 1)
+	go func() {
+		conn, err := p.connectToNextProxy()
+		proxyConnChan <- proxyResult{conn, err}
+	}()
+
+	// Handle client handshake while proxy connection is being established
+	if err := p.handleClientHandshake(clientConn); err != nil {
+		if errors.Is(err, errNoAcceptableAuth) {
+			response := []byte{socksVersion5, socksNoAcceptableMethods}
+			clientConn.Write(response)
+		} else {
+			sendSocks5Error(clientConn, nil, socksGeneralFailure)
+		}
+		// Clean up the proxy connection if it succeeded
+		if result := <-proxyConnChan; result.conn != nil {
+			result.conn.Close()
+		}
 		return
 	}
-	defer tcpConn.Close()
 
-	// Read the SOCKS5 handshake from client
-	if err := p.handleClientHandshake(tcpConn); err != nil {
-		fmt.Printf("Client handshake failed: %v\n", err)
-		return
-	}
-
-	// Connect to next proxy and authenticate
-	nextProxy, err := p.connectToNextProxy()
+	// Read the connection request
+	request, err := readConnectionRequest(clientConn)
 	if err != nil {
-		fmt.Printf("Failed to connect to next proxy: %v\n", err)
+		sendSocks5Error(clientConn, nil, socksGeneralFailure)
+		// Clean up the proxy connection if it succeeded
+		if result := <-proxyConnChan; result.conn != nil {
+			result.conn.Close()
+		}
 		return
 	}
-	defer nextProxy.Close()
 
-	// Forward the client's request to the next proxy
-	if err := p.forwardTraffic(tcpConn, nextProxy); err != nil {
-		fmt.Printf("Failed to forward traffic: %v\n", err)
+	// Wait for proxy connection result
+	pResult := <-proxyConnChan
+	if pResult.err != nil {
+		var errCode byte = socksGeneralFailure
+		if errors.Is(pResult.err, errNoAcceptableAuth) {
+			errCode = socksConnectionRefused
+		} else if strings.Contains(pResult.err.Error(), "no route to host") {
+			errCode = socksHostUnreachable
+		} else if strings.Contains(pResult.err.Error(), "network is unreachable") {
+			errCode = socksNetworkUnreachable
+		} else if errors.Is(err, errAuthFailed) {
+			errCode = socksConnectionRefused
+		}
+		sendSocks5Error(clientConn, request, errCode)
+		return
+	}
+	defer pResult.conn.Close()
+
+	if err := p.forwardTraffic(clientConn, pResult.conn, request); err != nil {
+		if !isConnectionClosedError(err) {
+			sendSocks5Error(clientConn, request, socksGeneralFailure)
+		}
 		return
 	}
 }
 
-func (p *Proxy) handleClientHandshake(conn net.Conn) error {
-	// Read version and number of methods
+func (p *Proxy) handleClientHandshake(conn *net.TCPConn) error {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(conn, header); err != nil {
-		return err
+		return fmt.Errorf("failed to read handshake header: %w", err)
 	}
 
-	if header[0] != 5 {
+	if header[0] != socksVersion5 {
 		return errors.New("invalid SOCKS version")
 	}
 
-	// Read authentication methods
 	methods := make([]byte, header[1])
 	if _, err := io.ReadFull(conn, methods); err != nil {
-		return err
+		return fmt.Errorf("failed to read auth methods: %w", err)
 	}
 
-	// Respond with no authentication required
-	response := []byte{5, 0}
+	// Check if the client supports no authentication
+	hasNoAuth := false
+	for _, method := range methods {
+		if method == socksAuthNoneRequired {
+			hasNoAuth = true
+			break
+		}
+	}
+
+	if !hasNoAuth {
+		return errNoAcceptableAuth
+	}
+
+	response := []byte{socksVersion5, 0}
 	if _, err := conn.Write(response); err != nil {
-		return err
+		return fmt.Errorf("failed to send auth response: %w", err)
 	}
 
 	return nil
 }
 
-func (p *Proxy) connectToNextProxy() (net.Conn, error) {
+func (p *Proxy) connectToNextProxy() (*net.TCPConn, error) {
 	// Connect to the next proxy
 	nextProxy, err := net.Dial("tcp", p.NextHost)
 	if err != nil {
@@ -208,7 +331,7 @@ func (p *Proxy) connectToNextProxy() (net.Conn, error) {
 
 	// SOCKS5 handshake with authentication
 	// Send version and auth methods (support both no auth and username/password auth)
-	if _, err := tcpConn.Write([]byte{5, 2, 0, 2}); err != nil {
+	if _, err := tcpConn.Write([]byte{socksVersion5, 2, socksAuthNoneRequired, socksAuthUsernamePass}); err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("failed to send auth methods: %w", err)
 	}
@@ -220,16 +343,16 @@ func (p *Proxy) connectToNextProxy() (net.Conn, error) {
 		return nil, fmt.Errorf("failed to read auth method response: %w", err)
 	}
 
-	if response[0] != 5 {
+	if response[0] != socksVersion5 {
 		tcpConn.Close()
 		return nil, errors.New("invalid SOCKS version in response")
 	}
 
 	// Handle authentication based on server's choice
 	switch response[1] {
-	case 0: // No authentication required
+	case socksAuthNoneRequired:
 		// Continue without authentication
-	case 2: // Username/password authentication
+	case socksAuthUsernamePass:
 		// Prepare auth request with correct length allocation
 		authLen := 1 + 1 + len(p.Username) + 1 + len(p.Password) // version + userlen + user + passlen + pass
 		auth := make([]byte, 0, authLen)
@@ -259,7 +382,7 @@ func (p *Proxy) connectToNextProxy() (net.Conn, error) {
 
 		if authResponse[1] != 0 {
 			tcpConn.Close()
-			return nil, errors.New("authentication failed")
+			return nil, errAuthFailed
 		}
 	default:
 		tcpConn.Close()
@@ -275,54 +398,53 @@ func (p *Proxy) connectToNextProxy() (net.Conn, error) {
 	return tcpConn, nil
 }
 
-func (p *Proxy) forwardTraffic(clientConn, nextProxy net.Conn) (err error) {
-	var connectionRequest []byte
-	connectionRequest, err = readConnectionRequest(clientConn)
-	if err != nil {
-		return fmt.Errorf("failed to read connection request: %w", err)
-	}
-	if _, err := nextProxy.Write(connectionRequest); err != nil {
+func (p *Proxy) forwardTraffic(clientConn, proxyConn *net.TCPConn, request []byte) error {
+	if _, err := proxyConn.Write(request); err != nil {
+		sendSocks5Error(clientConn, request, socksGeneralFailure)
 		return fmt.Errorf("failed to forward request: %w", err)
 	}
 
-	var response []byte
-	response, err = readConnectionResponse(nextProxy)
+	response, err := readConnectionResponse(proxyConn)
 	if err != nil {
-		return fmt.Errorf("failed to read connection response: %w", err)
+		// Forward the exact error response from the next proxy if we got one
+		if len(response) >= 2 {
+			clientConn.Write(response)
+		} else {
+			sendSocks5Error(clientConn, request, socksGeneralFailure)
+		}
+		return err
 	}
+
 	if _, err := clientConn.Write(response); err != nil {
 		return fmt.Errorf("failed to forward response: %w", err)
 	}
 
-	// Start bidirectional forwarding
-	done := make(chan error, 2)
+	// Bidirectional copy with proper error handling
+	errc := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(nextProxy, clientConn)
+		_, err := io.Copy(proxyConn, clientConn)
 		if err != nil && !isConnectionClosedError(err) {
-			err = fmt.Errorf("failed to copy from client to proxy: %w", err)
+			errc <- err
 		} else {
-			err = nil // Clear error if it's just a connection closure
+			errc <- nil
 		}
-		nextProxy.(*net.TCPConn).CloseWrite()
-		done <- err
+		proxyConn.CloseWrite()
 	}()
 
 	go func() {
-		_, err := io.Copy(clientConn, nextProxy)
+		_, err := io.Copy(clientConn, proxyConn)
 		if err != nil && !isConnectionClosedError(err) {
-			err = fmt.Errorf("failed to copy from proxy to client: %w", err)
+			errc <- err
 		} else {
-			err = nil // Clear error if it's just a connection closure
+			errc <- nil
 		}
-		clientConn.(*net.TCPConn).CloseWrite()
-		done <- err
+		clientConn.CloseWrite()
 	}()
 
 	// Wait for both copies to complete
 	for i := 0; i < 2; i++ {
-		err := <-done
-		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-			return fmt.Errorf("copy error: %w", err)
+		if err := <-errc; err != nil {
+			return err
 		}
 	}
 
@@ -335,26 +457,30 @@ func readConnectionRequest(clientConn net.Conn) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read request header: %w", err)
 	}
 
-	if header[0] != 5 {
+	if header[0] != socksVersion5 {
 		return nil, errors.New("invalid SOCKS version in request")
+	}
+
+	if header[1] != socksCmdConnect {
+		return nil, errUnsupportedCommand
 	}
 
 	// Read address type and address
 	var addrLen int
 	var domainLen []byte
 	switch header[3] {
-	case 1: // IPv4
+	case socksAddrIPv4:
 		addrLen = net.IPv4len
-	case 3: // Domain name
+	case socksAddrFQDN:
 		domainLen = make([]byte, 1)
 		if _, err := io.ReadFull(clientConn, domainLen); err != nil {
 			return nil, fmt.Errorf("failed to read domain length: %w", err)
 		}
 		addrLen = int(domainLen[0])
-	case 4: // IPv6
+	case socksAddrIPv6:
 		addrLen = net.IPv6len
 	default:
-		return nil, errors.New("unsupported address type")
+		return nil, errUnsupportedAddressType
 	}
 
 	// Read address and port
@@ -364,7 +490,7 @@ func readConnectionRequest(clientConn net.Conn) ([]byte, error) {
 	}
 
 	// Construct and forward the request to the next proxy
-	if header[3] == 3 {
+	if header[3] == socksAddrFQDN {
 		// For domain names, include the length byte
 		request := make([]byte, 0, 4+1+len(addr))
 		request = append(request, header...)
@@ -386,40 +512,40 @@ func readConnectionResponse(nextProxy net.Conn) ([]byte, error) {
 	}
 
 	switch response[1] {
-	case 0:
+	case socksSucceeded:
 		// Success
-	case 1:
-		return nil, errors.New("general SOCKS server failure")
-	case 2:
-		return nil, errors.New("connection not allowed by ruleset")
-	case 3:
-		return nil, errors.New("network unreachable")
-	case 4:
-		return nil, errors.New("host unreachable")
-	case 5:
-		return nil, errors.New("connection refused by destination host")
-	case 6:
-		return nil, errors.New("TTL expired")
-	case 7:
-		return nil, errors.New("command not supported / protocol error")
-	case 8:
-		return nil, errors.New("address type not supported")
+	case socksGeneralFailure:
+		return nil, errGeneralFailure
+	case socksNotAllowed:
+		return nil, errConnectionNotAllowed
+	case socksNetworkUnreachable:
+		return nil, errNetworkUnreachable
+	case socksHostUnreachable:
+		return nil, errHostUnreachable
+	case socksConnectionRefused:
+		return nil, errConnectionRefused
+	case socksTTLExpired:
+		return nil, errTTLExpired
+	case socksCommandNotSupported:
+		return nil, errUnsupportedCommand
+	case socksAddressNotSupported:
+		return nil, errAddressNotSupported
 	default:
 		return nil, fmt.Errorf("unknown error code: %d", response[1])
 	}
 
 	addrLen := 0
 	switch response[3] { // Address type
-	case 1:
+	case socksAddrIPv4:
 		addrLen = net.IPv4len
-	case 3:
+	case socksAddrFQDN:
 		domainLen := make([]byte, 1)
 		if _, err := io.ReadFull(nextProxy, domainLen); err != nil {
 			return nil, fmt.Errorf("error reading domain name length: %w", err)
 		}
 		addrLen = int(domainLen[0])
 		response = append(response, domainLen...)
-	case 4:
+	case socksAddrIPv6:
 		addrLen = net.IPv6len
 	default:
 		return nil, fmt.Errorf("unknown address type: %d", response[3])
