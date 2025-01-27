@@ -6,10 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
-	"net"
 	"net/http"
+	"sync"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 type nordServer struct {
@@ -113,46 +114,14 @@ type nordIPDetails struct {
 
 var servers []nordServer
 
-// FindNordVpnServer finds a socks server from the (undocumented) NordVPN API
-func FindNordVpnServer(ctx context.Context) (host string, err error) {
-	// since this operation is kinda slow, we ant to use a very simple cache
-	if len(servers) == 0 {
-		servers, err = findNordVpnServers(ctx)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	for {
-		if len(servers) == 0 {
-			return "", fmt.Errorf("no socks server found")
-		}
-
-		// choose a random server
-		randIdx := rand.Intn(len(servers))
-		chosenAddr := servers[randIdx].Hostname + ":1080"
-
-		// check if the server is reachable
-		conn, err := net.DialTimeout("tcp", chosenAddr, time.Second)
-		if err == nil {
-			conn.Close()
-			return chosenAddr, nil
-		}
-
-		// remove the server from the list
-		servers = removeAtIndexNoOrder(servers, randIdx)
-		continue
-	}
-}
-
-func findNordVpnServers(ctx context.Context) ([]nordServer, error) {
+func GetNordVpnServers(ctx context.Context, nordvpnUser, nordvpnPassword string) ([]nordServer, error) {
 	url := "https://api.nordvpn.com/v1/servers?limit=0"
 	servers, err := fetchJson[[]nordServer](ctx, url)
 	if err != nil {
 		return nil, err
 	}
 
-	socks5Servers := make([]nordServer, 0)
+	socksServers := []nordServer{}
 	for _, server := range servers {
 		if server.Status != "online" {
 			continue
@@ -165,12 +134,47 @@ func findNordVpnServers(ctx context.Context) ([]nordServer, error) {
 		for _, tech := range server.Technologies {
 			// check if it is a SOCKS5 server
 			if tech.ID == 7 && tech.Pivot.Status == "online" {
-				socks5Servers = append(socks5Servers, server)
+				socksServers = append(socksServers, server)
 			}
 		}
 	}
 
-	return socks5Servers, nil
+	// check which work, NordVPN will randomly give AUTH errors
+	availableServersC := make(chan nordServer, len(socksServers))
+	var wg sync.WaitGroup
+	for _, server := range socksServers {
+		wg.Add(1)
+		go func(server nordServer) {
+			defer wg.Done()
+
+			auth := &proxy.Auth{User: nordvpnUser, Password: nordvpnPassword}
+			dialer, err := proxy.SOCKS5("tcp", server.Hostname+":1080", auth, proxy.Direct)
+			if err != nil {
+				return
+			}
+
+			client := &http.Client{Transport: &http.Transport{Dial: dialer.Dial}, Timeout: 30 * time.Second}
+			req, err := http.NewRequestWithContext(ctx, "GET", "https://www.google.com", nil)
+			if err != nil {
+				return
+			}
+
+			_, err = client.Do(req)
+			if err != nil {
+				return
+			}
+
+			availableServersC <- server
+		}(server)
+	}
+	wg.Wait()
+	close(availableServersC)
+	var availableServers []nordServer
+	for server := range availableServersC {
+		availableServers = append(availableServers, server)
+	}
+
+	return availableServers, nil
 }
 
 func fetchJson[T any](ctx context.Context, url string) (defaultVal T, err error) {
